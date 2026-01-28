@@ -3,7 +3,7 @@ import logging
 import uuid
 
 import re
-import sha3
+from manticore.crypto.keccak import keccak256
 
 from . import abitypes
 from ..core.smtlib import (
@@ -198,9 +198,7 @@ class ABI:
         """
         Makes a function hash id from a method signature
         """
-        s = sha3.keccak_256()
-        s.update(method_name_and_signature.encode())
-        return bytes(s.digest()[:4])
+        return keccak256(method_name_and_signature.encode())[:4]
 
     @staticmethod
     def deserialize(type_spec, data):
