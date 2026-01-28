@@ -28,7 +28,8 @@ class GenerateCommand(Command):
         )
 
 
-PB_VER = "3.20"
+# Minimum protobuf version for types-protobuf compatibility
+TYPES_PROTOBUF_MIN_VER = "3.20"
 
 setup(
     name="manticore_server",
@@ -45,7 +46,7 @@ setup(
         "dev": [
             "grpcio-tools",
             "mypy-protobuf",
-            f"types-protobuf>={PB_VER}",
+            f"types-protobuf>={TYPES_PROTOBUF_MIN_VER}",
             "shiv~=1.0.1",
             "types-setuptools",
             "black>=24.0",
