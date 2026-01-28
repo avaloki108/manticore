@@ -34,11 +34,11 @@ setup(
     name="manticore_server",
     version="0.0.1",
     packages=find_packages(exclude=["tests", "tests.*"]),
-    python_requires=">=3.7",
+    python_requires=">=3.9",
     install_requires=[
         f"manticore[native] @ file://{Path(__file__).parent.resolve()}/..",
         f"protobuf~={PB_VER}",
-        "grpcio~=1.46",
+        "grpcio>=1.60,<2.0",
         "crytic-compile>=0.2.2",
     ],
     extras_require={
@@ -48,16 +48,15 @@ setup(
             f"types-protobuf~={PB_VER}",
             "shiv~=1.0.1",
             "types-setuptools",
-            "black~=22.0",
-            "isort==5.10.1",
-            "mypy==0.942",
+            "black>=24.0",
+            "isort>=5.12",
+            "mypy>=1.0",
         ]
     },
     entry_points={
         "console_scripts": [
             "manticore_server=manticore_server.manticore_server:main",
         ],
-        "distutils.commands": ["generate = GenerateCommand"],
     },
     cmdclass={
         "generate": GenerateCommand,
