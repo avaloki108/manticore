@@ -67,7 +67,23 @@ def choose_detectors(args):
 
     detectors_to_run = []
 
-    if not args.exclude_all:
+    # Handle --enable-detectors flag (takes precedence over --exclude and --exclude-all)
+    if args.detectors_to_enable:
+        enable_list = args.detectors_to_enable.split(",")
+
+        if enable_list == ["all"]:
+            # Enable all detectors
+            detectors_to_run = all_detector_classes
+        else:
+            # Enable only specified detectors
+            for e in enable_list:
+                if e not in arguments:
+                    raise Exception(
+                        f"{e} is not a detector name, must be one of {arguments}. See also `--list-detectors`."
+                    )
+                detectors_to_run.append(detectors[e])
+    elif not args.exclude_all:
+        # Default behavior: run all detectors except those in --exclude
         exclude = []
 
         if args.detectors_to_exclude:
@@ -87,7 +103,7 @@ def choose_detectors(args):
 
 
 def ethereum_main(args, logger):
-    m = ManticoreEVM(workspace_url=args.workspace)
+    m = ManticoreEVM(workspace_url=args.workspace, output_path=args.output)
 
     if not args.thorough_mode:
         args.avoid_constant = True
@@ -145,6 +161,19 @@ def ethereum_main(args, logger):
             m.finalize(only_alive_states=args.only_alive_testcases)
         else:
             m.kill()
+
+        # Collect and write findings if output_path is specified
+        if args.output:
+            from .finding import FindingSink
+            from .exploit_detectors import ExploitDetector
+            sink = FindingSink(args.output)
+            # Collect findings from all ExploitDetector instances
+            for detector_name, detector_instance in m.detectors.items():
+                if isinstance(detector_instance, ExploitDetector) and hasattr(detector_instance, 'findings'):
+                    for finding in detector_instance.findings:
+                        sink.add_finding(finding)
+            sink.write_json()
+            logger.info(f"Wrote findings to {args.output}")
 
         for detector in list(m.detectors):
             m.unregister_detector(detector)

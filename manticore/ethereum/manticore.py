@@ -405,12 +405,13 @@ class ManticoreEVM(ManticoreBase):
     def get_account(self, name):
         return self._accounts[name]
 
-    def __init__(self, plugins=None, **kwargs):
+    def __init__(self, plugins=None, output_path=None, **kwargs):
         """
         A Manticore EVM manager
-        :param plugins: the plugins to register in this manticore manager
+        :param plugins: plugins to register in this manticore manager
+        :param output_path: path to write structured findings JSON output
         """
-        # Make the constraint store
+        # Make constraint store
         constraints = ConstraintSet()
         # make the ethereum world state
         world = evm.EVMWorld(constraints)
@@ -434,6 +435,7 @@ class ManticoreEVM(ManticoreBase):
         self.constraints = constraints
         self.detectors: Dict[str, Detector] = {}
         self.metadata: Dict[int, SolidityMetadata] = {}
+        self._output_path = output_path
 
     @property
     def world(self):
@@ -1328,7 +1330,8 @@ class ManticoreEVM(ManticoreBase):
             for xa, ya in symbolic_pairs:
                 cond = False
                 for xc, yc in known_pairs:
-                    if len(xa) == len(xc):
+                    if len(xa) == len(xc):  # If the size of the buffer wont
+                        # match it does not matter
                         cond = Operators.OR(Operators.AND(xa == xc, ya == yc), cond)
                 state.constrain(cond)
                 if cond is False:

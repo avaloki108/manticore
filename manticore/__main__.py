@@ -203,6 +203,15 @@ def parse_arguments() -> argparse.Namespace:
         "--exclude-all", help="Excludes all detectors", action="store_true", default=False
     )
 
+    eth_detectors.add_argument(
+        "--enable-detectors",
+        help="Enable specific detectors: 'all' or comma-separated list (e.g., 'DetectIntegerOverflow,DetectReentrancySimple'). "
+             "If specified, only these detectors will run.",
+        action="store",
+        dest="detectors_to_enable",
+        default=None,
+    )
+
     eth_flags.add_argument(
         "--avoid-constant",
         action="store_true",
@@ -232,6 +241,13 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Configure Manticore for more exhaustive exploration. Evaluate gas, generate testcases for dead states, "
         "explore constant functions, and run a small suite of detectors.",
+    )
+
+    eth_flags.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Path to write structured findings JSON output (e.g., /path/findings.json)",
     )
 
     config_flags = parser.add_argument_group("Constants")
