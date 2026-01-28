@@ -70,7 +70,7 @@ setup(
         "pyyaml",
         "protobuf~=3.20",
         # evm dependencies
-        "pysha3",
+        "eth-hash[pycryptodome]",
         "prettytable",
         "ply",
         "rlp",

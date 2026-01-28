@@ -71,7 +71,7 @@ from manticore.utils import config
 
     if any("logs" in testcase for testcase in testcases.values()):
         body += """
-import sha3
+from manticore.crypto.keccak import keccak256
 import rlp
 from rlp.sedes import (
     CountableList,
@@ -240,7 +240,7 @@ def gen_body(name, testcase):
             # check logs
             logs = [Log(unhexlify('{'{'}:040x{'}'}'.format(l.address)), l.topics, solve(l.memlog)) for l in world.logs]
             data = rlp.encode(logs)
-            self.assertEqual(sha3.keccak_256(data).hexdigest(), '{testcase['logs'][2:]}')"""
+            self.assertEqual(keccak256(data).hex(), '{testcase['logs'][2:]}')"""
 
     return body
 
