@@ -28,7 +28,7 @@ class GenerateCommand(Command):
         )
 
 
-PB_VER = 3.20
+PB_VER = "3.20"
 
 setup(
     name="manticore_server",
@@ -37,7 +37,7 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         f"manticore[native] @ file://{Path(__file__).parent.resolve()}/..",
-        f"protobuf~={PB_VER}",
+        "protobuf>=3.20,<6.0",
         "grpcio>=1.60,<2.0",
         "crytic-compile>=0.2.2",
     ],
@@ -45,7 +45,7 @@ setup(
         "dev": [
             "grpcio-tools",
             "mypy-protobuf",
-            f"types-protobuf~={PB_VER}",
+            f"types-protobuf>={PB_VER}",
             "shiv~=1.0.1",
             "types-setuptools",
             "black>=24.0",
