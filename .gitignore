@@ -99,3 +99,4 @@ venvpy27/
 
 # mypy cache
 .mypy_cache/
+.vscode/
