@@ -10,7 +10,6 @@ import random
 import tempfile
 import time
 
-from crytic_compile import CryticCompile, InvalidCompilation, is_supported
 
 from ..core.manticore import ManticoreBase, ManticoreError
 
@@ -263,6 +262,8 @@ class ManticoreEVM(ManticoreBase):
         :type crytic_compile_args: dict
         :return:
         """
+        from crytic_compile import CryticCompile, InvalidCompilation
+
         try:
 
             if crytic_compile_args:
@@ -338,6 +339,7 @@ class ManticoreEVM(ManticoreBase):
         """
 
         crytic_compile_args = dict() if crytic_compile_args is None else crytic_compile_args
+        from crytic_compile import is_supported
 
         if isinstance(source_code, io.IOBase):
             source_code = source_code.name
