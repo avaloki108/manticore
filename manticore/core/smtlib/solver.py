@@ -15,6 +15,7 @@
 # You can add new constraints. A new constraint may change the state from {None, sat} to {sat, unsat, unknown}
 
 import collections
+import hashlib
 import fcntl
 import os
 import shlex
@@ -23,7 +24,7 @@ import time
 from abc import abstractmethod
 from random import shuffle
 from subprocess import PIPE, Popen, check_output
-from typing import Any, Sequence, List
+from typing import Any, Sequence, List, Optional, Tuple
 
 from . import operators as Operators
 from .constraints import *
@@ -34,7 +35,9 @@ from ...utils import config
 logger = logging.getLogger(__name__)
 consts = config.get_group("smt")
 consts.add("timeout", default=120, description="Timeout, in seconds, for each Z3 invocation")
+consts.add("fast_timeout", default=5, description="Fast timeout, in seconds, for solver attempts")
 consts.add("memory", default=1024 * 8, description="Max memory for Z3 to use (in Megabytes)")
+consts.add("cache_size", default=256, description="Maximum solver cache entries per category")
 consts.add(
     "maxsolutions",
     default=10000,
@@ -102,6 +105,32 @@ def _convert(v):
 
     assert r is not None
     return r
+
+
+_CACHE_MISS = object()
+
+
+class _LRUCache:
+    def __init__(self, maxsize: int):
+        self._maxsize = maxsize
+        self._data = collections.OrderedDict()
+
+    def get(self, key):
+        if key in self._data:
+            value = self._data.pop(key)
+            self._data[key] = value
+            return value
+        return _CACHE_MISS
+
+    def set(self, key, value):
+        self._data[key] = value
+        self._data.move_to_end(key)
+        if len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+
+def _stable_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 class SingletonMixin(object):
@@ -263,7 +292,7 @@ class SmtlibProc:
             )
             raise e
 
-    def recv(self, wait=True) -> Optional[str]:
+    def recv(self, wait=True, timeout: Optional[float] = None) -> Optional[str]:
         """Reads the response from the smtlib solver
 
         :param wait: a boolean that indicate to wait with a blocking call
@@ -271,14 +300,19 @@ class SmtlibProc:
         does not respond.
 
         """
+        start = time.time()
         tries = 0
-        timeout = 0.0
+        sleep_time = 0.0
 
         buf = ""
         if self._last_buf != "":  # we got a partial response last time, let's use it
             buf = buf + self._last_buf
 
         while True:
+            if timeout is not None and time.time() - start > timeout:
+                if buf != "":
+                    self._last_buf = buf
+                return None
             try:
                 buf = buf + self._proc.stdout.read()  # type: ignore
                 buf = buf.strip()
@@ -299,8 +333,8 @@ class SmtlibProc:
                 break
 
             if tries > 3:
-                time.sleep(timeout)
-                timeout += 0.1
+                time.sleep(sleep_time)
+                sleep_time += 0.1
 
         buf = buf.strip()
         self._last_buf = ""
@@ -340,6 +374,62 @@ class SMTLIBSolver(Solver):
     def inits(self) -> List[str]:
         raise NotImplementedError()
 
+    def _init_solver_state(self) -> None:
+        self._sat_cache = _LRUCache(consts.cache_size)
+        self._model_cache = _LRUCache(consts.cache_size)
+        self._all_values_cache = _LRUCache(consts.cache_size)
+        self._current_constraints_hash = None
+        self._current_constraints_set = None
+        self._current_declared_names = set()
+        self._current_constraints_smtlib = None
+
+    def _constraints_info(self, constraints: ConstraintSet) -> Tuple[str, str]:
+        smtlib = constraints.to_string()
+        return smtlib, _stable_hash(smtlib)
+
+    def _declare_new_vars(self, constraints: ConstraintSet) -> None:
+        for var in constraints.get_declared_variables():
+            if var.name not in self._current_declared_names:
+                self._smtlib.send(var.declaration)
+                self._current_declared_names.add(var.name)
+
+    def _set_constraints(
+        self,
+        constraints: ConstraintSet,
+        constraints_smtlib: Optional[str] = None,
+        constraints_hash: Optional[str] = None,
+    ) -> str:
+        if constraints_smtlib is None or constraints_hash is None:
+            constraints_smtlib, constraints_hash = self._constraints_info(constraints)
+
+        if constraints_hash == self._current_constraints_hash:
+            return constraints_hash
+
+        new_constraints = constraints.constraints
+        if (
+            self._support_pushpop
+            and self._current_constraints_set is not None
+            and isinstance(self._current_constraints_set, set)
+        ):
+            new_constraints_set = set(new_constraints)
+            if self._current_constraints_set.issubset(new_constraints_set):
+                self._push()
+                self._declare_new_vars(constraints)
+                for constraint in new_constraints:
+                    if constraint not in self._current_constraints_set:
+                        self._assert(constraint)
+                self._current_constraints_set = new_constraints_set
+                self._current_constraints_hash = constraints_hash
+                self._current_constraints_smtlib = constraints_smtlib
+                return constraints_hash
+
+        self._reset(constraints_smtlib)
+        self._current_constraints_set = set(new_constraints)
+        self._current_declared_names = {var.name for var in constraints.get_declared_variables()}
+        self._current_constraints_hash = constraints_hash
+        self._current_constraints_smtlib = constraints_smtlib
+        return constraints_hash
+
     def __init__(
         self,
         command: str,
@@ -357,6 +447,7 @@ class SMTLIBSolver(Solver):
         """
         super().__init__()
         self._smtlib: SmtlibProc = SmtlibProc(command, debug)
+        self._init_solver_state()
 
         # Commands used to initialize smtlib
         if init is None:
@@ -395,9 +486,16 @@ class SMTLIBSolver(Solver):
 
         if constraints is not None:
             self._smtlib.send(constraints)
+            self._current_constraints_smtlib = constraints
+            self._current_constraints_hash = _stable_hash(constraints)
+        else:
+            self._current_constraints_smtlib = None
+            self._current_constraints_hash = None
+        self._current_constraints_set = None
+        self._current_declared_names = set()
 
     # UTILS: check-sat get-value
-    def _is_sat(self) -> bool:
+    def _is_sat(self, timeout: Optional[float] = None) -> bool:
         """
         Check the satisfiability of the current state
 
@@ -405,8 +503,11 @@ class SMTLIBSolver(Solver):
         """
         start = time.time()
         self._smtlib.send("(check-sat)")
-        status = self._smtlib.recv()
-        assert status is not None
+        status = self._smtlib.recv(timeout=timeout)
+        if status is None:
+            logger.info("Solver timeout while waiting for check-sat response")
+            SOLVER_STATS["timeout"] += 1
+            raise SolverUnknown("timeout")
         logger.debug("Check took %s seconds (%s)", time.time() - start, status)
         if "ALARM TRIGGERED" in status:
             return False
@@ -430,15 +531,36 @@ class SMTLIBSolver(Solver):
 
         return status == "sat"
 
+    def _check_sat(self, extra_constraints: Optional[List[Bool]] = None) -> bool:
+        fast_timeout = consts.fast_timeout
+        if fast_timeout <= 0 or fast_timeout >= consts.timeout:
+            return self._is_sat(timeout=consts.timeout)
+
+        try:
+            return self._is_sat(timeout=fast_timeout)
+        except SolverUnknown:
+            logger.info("Fallback solver attempt after timeout/unknown")
+            if self._current_constraints_smtlib is not None:
+                self._reset(self._current_constraints_smtlib)
+                if extra_constraints:
+                    if self._support_pushpop:
+                        self._push()
+                    for constraint in extra_constraints:
+                        self._assert(constraint)
+            return self._is_sat(timeout=consts.timeout)
+
     def _assert(self, expression: Bool):
         """Auxiliary method to send an assert"""
         smtlib = translate_to_smtlib(expression)
         self._smtlib.send(f"(assert {smtlib})")
 
-    def __getvalue_bv(self, expression_str: str) -> int:
+    def __getvalue_bv(self, expression_str: str, timeout: Optional[float] = None) -> int:
         self._smtlib.send(f"(get-value ({expression_str}))")
-        t = self._smtlib.recv()
-        assert t is not None
+        t = self._smtlib.recv(timeout=timeout)
+        if t is None:
+            logger.info("Solver timeout while waiting for get-value response")
+            SOLVER_STATS["timeout"] += 1
+            raise SolverUnknown("timeout")
         base = 2
         m = RE_GET_EXPR_VALUE_FMT_BIN.match(t)
         if m is None:
@@ -453,16 +575,25 @@ class SMTLIBSolver(Solver):
         expr, value = m.group("expr"), m.group("value")  # type: ignore
         return int(value, base)
 
-    def __getvalue_bool(self, expression_str):
+    def __getvalue_bool(self, expression_str, timeout: Optional[float] = None):
         self._smtlib.send(f"(get-value ({expression_str}))")
-        ret = self._smtlib.recv()
+        ret = self._smtlib.recv(timeout=timeout)
+        if ret is None:
+            logger.info("Solver timeout while waiting for get-value response")
+            SOLVER_STATS["timeout"] += 1
+            raise SolverUnknown("timeout")
         return {"true": True, "false": False, "#b0": False, "#b1": True}[ret[2:-2].split(" ")[1]]
 
-    def __getvalue_all(self, expressions_str: List[str], is_bv: List[bool]) -> Dict[str, int]:
+    def __getvalue_all(
+        self, expressions_str: List[str], is_bv: List[bool], timeout: Optional[float] = None
+    ) -> Dict[str, int]:
         all_expressions_str = " ".join(expressions_str)
         self._smtlib.send(f"(get-value ({all_expressions_str}))")
-        ret_solver: Optional[str] = self._smtlib.recv()
-        assert ret_solver is not None
+        ret_solver: Optional[str] = self._smtlib.recv(timeout=timeout)
+        if ret_solver is None:
+            logger.info("Solver timeout while waiting for get-value response")
+            SOLVER_STATS["timeout"] += 1
+            raise SolverUnknown("timeout")
         return_values = re.findall(RE_GET_EXPR_VALUE_ALL, ret_solver)
         return {value[0]: _convert(value[1]) for value in return_values}
 
@@ -476,17 +607,18 @@ class SMTLIBSolver(Solver):
         if not issymbolic(expression):
             return expression
 
+        timeout = consts.timeout
         if isinstance(expression, Array):
             result = bytearray()
             for c in expression:
                 expression_str = translate_to_smtlib(c)
-                result.append(self.__getvalue_bv(expression_str))
+                result.append(self.__getvalue_bv(expression_str, timeout=timeout))
             return bytes(result)
         else:
             if isinstance(expression, BoolVariable):
-                return self.__getvalue_bool(expression.name)
+                return self.__getvalue_bool(expression.name, timeout=timeout)
             elif isinstance(expression, BitVecVariable):
-                return self.__getvalue_bv(expression.name)
+                return self.__getvalue_bv(expression.name, timeout=timeout)
 
         raise NotImplementedError(
             f"_getvalue only implemented for Bool, BitVec and Array. Got {type(expression)}"
@@ -501,21 +633,49 @@ class SMTLIBSolver(Solver):
         """Recall the last pushed constraint store and state."""
         self._smtlib.send("(pop 1)")
 
-    @lru_cache(maxsize=32)
     def can_be_true(self, constraints: ConstraintSet, expression: Union[bool, Bool] = True) -> bool:
         """Check if two potentially symbolic values can be equal"""
         if isinstance(expression, bool):
             if not expression:
                 return expression
-            else:
-                # if True check if constraints are feasible
-                self._reset(constraints.to_string())
-                return self._is_sat()
+            constraints_smtlib, constraints_hash = self._constraints_info(constraints)
+            cache_key = ("sat", constraints_hash, None)
+            cached = self._sat_cache.get(cache_key)
+            if cached is not _CACHE_MISS:
+                logger.info("Solver cache hit for SAT result")
+                return cached
+            self._set_constraints(constraints, constraints_smtlib, constraints_hash)
+            result = self._check_sat()
+            self._sat_cache.set(cache_key, result)
+            return result
 
-        with constraints as temp_cs:
-            temp_cs.add(expression)
-            self._reset(temp_cs.to_string())
-            return self._is_sat()
+        expression = simplify(expression)
+        expr_smt = translate_to_smtlib(expression)
+        expr_hash = _stable_hash(expr_smt)
+        constraints_smtlib, constraints_hash = self._constraints_info(constraints)
+        cache_key = ("sat", constraints_hash, expr_hash)
+        cached = self._sat_cache.get(cache_key)
+        if cached is not _CACHE_MISS:
+            logger.info("Solver cache hit for SAT result")
+            return cached
+
+        if self._support_pushpop:
+            self._set_constraints(constraints, constraints_smtlib, constraints_hash)
+            self._push()
+            try:
+                self._assert(expression)
+                result = self._check_sat(extra_constraints=[expression])
+            finally:
+                self._pop()
+        else:
+            with constraints as temp_cs:
+                temp_cs.add(expression)
+                temp_smtlib, temp_hash = self._constraints_info(temp_cs)
+                self._set_constraints(temp_cs, temp_smtlib, temp_hash)
+                result = self._check_sat()
+
+        self._sat_cache.set(cache_key, result)
+        return result
 
     # get-all-values min max minmax
     def _optimize_generic(self, constraints: ConstraintSet, x: BitVec, goal: str, max_iter=10000):
@@ -601,7 +761,6 @@ class SMTLIBSolver(Solver):
             SOLVER_STATS["unknown"] += 1
             raise SolverError("Optimizing error, unsat or unknown core")
 
-    @lru_cache(maxsize=32)
     def get_all_values(
         self,
         constraints: ConstraintSet,
@@ -637,35 +796,66 @@ class SMTLIBSolver(Solver):
                     f"get_all_values only implemented for {type(expression)} expression type."
                 )
 
-            temp_cs.add(var == expression)
-            self._reset(temp_cs.to_string())
+            constraints_smtlib, constraints_hash = self._constraints_info(temp_cs)
+            expr_smt = translate_to_smtlib(expression)
+            expr_hash = _stable_hash(expr_smt)
+            cache_key = ("all", constraints_hash, expr_hash, maxcnt)
+            cached = self._all_values_cache.get(cache_key)
+            if cached is not _CACHE_MISS:
+                logger.info("Solver cache hit for all-values result")
+                return list(cached)
+
+            self._set_constraints(temp_cs, constraints_smtlib, constraints_hash)
+            extra_constraints = [var == expression]
+            if self._support_pushpop:
+                self._push()
+                for constraint in extra_constraints:
+                    self._assert(constraint)
+            else:
+                temp_cs.add(extra_constraints[0])
+                temp_smtlib, temp_hash = self._constraints_info(temp_cs)
+                self._set_constraints(temp_cs, temp_smtlib, temp_hash)
+
             result = []
             start = time.time()
-            while self._is_sat():
-                value = self._getvalue(var)
-                result.append(value)
+            complete = True
+            try:
+                while self._check_sat(extra_constraints=extra_constraints):
+                    value = self._getvalue(var)
+                    result.append(value)
 
-                if len(result) >= maxcnt:
-                    if silent:
-                        # do not throw an exception if set to silent
-                        # Default is not silent, assume user knows
-                        # what they are doing and will check the size
-                        # of returned vals list (previous smtlib behavior)
-                        break
+                    if len(result) >= maxcnt:
+                        complete = False
+                        if silent:
+                            # do not throw an exception if set to silent
+                            # Default is not silent, assume user knows
+                            # what they are doing and will check the size
+                            # of returned vals list (previous smtlib behavior)
+                            break
+                        else:
+                            raise TooManySolutions(result)
+                    if time.time() - start > consts.timeout:
+                        SOLVER_STATS["timeout"] += 1
+                        complete = False
+                        if silent:
+                            logger.info("Timeout searching for all solutions")
+                            break
+                        raise SolverError("Timeout")
+                    # Sometimes adding a new contraint after a check-sat eats all the mem
+                    new_constraint = var != value
+                    extra_constraints.append(new_constraint)
+                    if self._multiple_check:
+                        self._smtlib.send(f"(assert {translate_to_smtlib(new_constraint)})")
                     else:
-                        raise TooManySolutions(result)
-                if time.time() - start > consts.timeout:
-                    SOLVER_STATS["timeout"] += 1
-                    if silent:
-                        logger.info("Timeout searching for all solutions")
-                        return list(result)
-                    raise SolverError("Timeout")
-                # Sometimes adding a new contraint after a check-sat eats all the mem
-                if self._multiple_check:
-                    self._smtlib.send(f"(assert {translate_to_smtlib(var != value)})")
-                else:
-                    temp_cs.add(var != value)
-                    self._reset(temp_cs.to_string())
+                        temp_cs.add(new_constraint)
+                        temp_smtlib, temp_hash = self._constraints_info(temp_cs)
+                        self._set_constraints(temp_cs, temp_smtlib, temp_hash)
+            finally:
+                if self._support_pushpop:
+                    self._pop()
+
+            if complete:
+                self._all_values_cache.set(cache_key, list(result))
             return list(result)
 
     def _optimize_fancy(self, constraints: ConstraintSet, x: BitVec, goal: str, max_iter=10000):
@@ -691,7 +881,11 @@ class SMTLIBSolver(Solver):
             self._assert(operation(X, aux))
             self._smtlib.send("(%s %s)" % (goal, aux.name))
             self._smtlib.send("(check-sat)")
-            _status = self._smtlib.recv()
+            _status = self._smtlib.recv(timeout=consts.timeout)
+            if _status is None:
+                logger.info("Solver timeout while waiting for optimize response")
+                SOLVER_STATS["timeout"] += 1
+                raise SolverUnknown("timeout")
 
             assert self.sname is not None
             SOLVER_STATS.setdefault(self.sname, 0)
@@ -717,78 +911,123 @@ class SMTLIBSolver(Solver):
         start = time.time()
         with constraints.related_to(*expressions) as temp_cs:
             vars: List[Any] = []
+            expr_cache_keys: List[Optional[str]] = []
+            extra_constraints: List[Bool] = []
             for idx, expression in enumerate(expressions):
                 if not issymbolic(expression):
                     values[idx] = expression
                     vars.append(None)
+                    expr_cache_keys.append(None)
                     continue
                 assert isinstance(expression, (Bool, BitVec, Array))
+                expr_smt = translate_to_smtlib(simplify(expression))
+                expr_cache_keys.append(expr_smt)
                 if isinstance(expression, Bool):
                     var = temp_cs.new_bool()
                     vars.append(var)
-                    temp_cs.add(var == expression)
+                    extra_constraints.append(var == expression)
                 elif isinstance(expression, BitVec):
                     var = temp_cs.new_bitvec(expression.size)
                     vars.append(var)
-                    temp_cs.add(var == expression)
+                    extra_constraints.append(var == expression)
                 elif isinstance(expression, Array):
                     var = []
                     for i in range(expression.index_max):
                         subvar = temp_cs.new_bitvec(expression.value_bits)
                         var.append(subvar)
-                        temp_cs.add(subvar == simplify(expression[i]))
+                        extra_constraints.append(subvar == simplify(expression[i]))
                     vars.append(var)
 
-            self._reset(temp_cs.to_string())
-            if not self._is_sat():
-                raise SolverError(
-                    "Solver could not find a value for expression under current constraint set"
-                )
+            constraints_smtlib, constraints_hash = self._constraints_info(temp_cs)
+            model_cache = self._model_cache.get(constraints_hash)
+            if model_cache is not _CACHE_MISS:
+                if all(
+                    key is None or key in model_cache for key in expr_cache_keys
+                ):
+                    logger.info("Solver cache hit for model values")
+                    for idx, key in enumerate(expr_cache_keys):
+                        if key is None:
+                            continue
+                        values[idx] = model_cache[key]
+                    return values
 
-            values_to_ask: List[str] = []
-            is_bv: List[bool] = []
-            for idx, expression in enumerate(expressions):
-                if not issymbolic(expression):
-                    continue
-                var = vars[idx]
-                if isinstance(expression, Bool):
-                    values_to_ask.append(var.name)
-                    is_bv.append(False)
-                if isinstance(expression, BitVec):
-                    values_to_ask.append(var.name)
-                    is_bv.append(True)
-                if isinstance(expression, Array):
-                    # result = []
-                    for i in range(expression.index_max):
-                        values_to_ask.append(var[i].name)
+            self._set_constraints(temp_cs, constraints_smtlib, constraints_hash)
+            pushed = False
+            if extra_constraints:
+                if self._support_pushpop:
+                    self._push()
+                    pushed = True
+                    for constraint in extra_constraints:
+                        self._assert(constraint)
+                else:
+                    for constraint in extra_constraints:
+                        temp_cs.add(constraint)
+                    temp_smtlib, temp_hash = self._constraints_info(temp_cs)
+                    self._set_constraints(temp_cs, temp_smtlib, temp_hash)
+
+            try:
+                if not self._check_sat(extra_constraints=extra_constraints):
+                    raise SolverError(
+                        "Solver could not find a value for expression under current constraint set"
+                    )
+
+                values_to_ask: List[str] = []
+                is_bv: List[bool] = []
+                for idx, expression in enumerate(expressions):
+                    if not issymbolic(expression):
+                        continue
+                    var = vars[idx]
+                    if isinstance(expression, Bool):
+                        values_to_ask.append(var.name)
+                        is_bv.append(False)
+                    if isinstance(expression, BitVec):
+                        values_to_ask.append(var.name)
                         is_bv.append(True)
+                    if isinstance(expression, Array):
+                        # result = []
+                        for i in range(expression.index_max):
+                            values_to_ask.append(var[i].name)
+                            is_bv.append(True)
 
-            if values_to_ask == []:
-                return values
+                if values_to_ask == []:
+                    return values
 
-            values_returned = self.__getvalue_all(values_to_ask, is_bv)
-            for idx, expression in enumerate(expressions):
-                if not issymbolic(expression):
-                    continue
-                var = vars[idx]
-                if isinstance(expression, Bool):
-                    values[idx] = values_returned[var.name]
-                if isinstance(expression, BitVec):
-                    if var.name not in values_returned:
-                        logger.error(
-                            "var.name", var.name, "not in values_returned", values_returned
-                        )
+                values_returned = self.__getvalue_all(
+                    values_to_ask, is_bv, timeout=consts.timeout
+                )
+                for idx, expression in enumerate(expressions):
+                    if not issymbolic(expression):
+                        continue
+                    var = vars[idx]
+                    if isinstance(expression, Bool):
+                        values[idx] = values_returned[var.name]
+                    if isinstance(expression, BitVec):
+                        if var.name not in values_returned:
+                            logger.error(
+                                "var.name", var.name, "not in values_returned", values_returned
+                            )
 
-                    values[idx] = values_returned[var.name]
-                if isinstance(expression, Array):
-                    result = []
-                    for i in range(expression.index_max):
-                        result.append(values_returned[var[i].name])
-                    values[idx] = bytes(result)
+                        values[idx] = values_returned[var.name]
+                    if isinstance(expression, Array):
+                        result = []
+                        for i in range(expression.index_max):
+                            result.append(values_returned[var[i].name])
+                        values[idx] = bytes(result)
 
-            if time.time() - start > consts.timeout:
-                SOLVER_STATS["timeout"] += 1
-                raise SolverError("Timeout")
+                if time.time() - start > consts.timeout:
+                    SOLVER_STATS["timeout"] += 1
+                    raise SolverError("Timeout")
+
+                if model_cache is _CACHE_MISS:
+                    model_cache = {}
+                for idx, key in enumerate(expr_cache_keys):
+                    if key is None:
+                        continue
+                    model_cache[key] = values[idx]
+                self._model_cache.set(constraints_hash, model_cache)
+            finally:
+                if pushed:
+                    self._pop()
 
         return values
 
@@ -974,13 +1213,16 @@ class SmtlibPortfolio:
 
             proc.send(cmd)
 
-    def recv(self) -> str:
+    def recv(self, timeout: Optional[float] = None) -> Optional[str]:
         """Reads the response from the smtlib solver"""
+        start = time.time()
         tries = 0
-        timeout = 0.0
+        sleep_time = 0.0
         inds = list(range(len(self._procs)))
         # print(self._solvers)
         while True:
+            if timeout is not None and time.time() - start > timeout:
+                return None
             shuffle(inds)
             for i in inds:
 
@@ -1002,8 +1244,8 @@ class SmtlibPortfolio:
                     tries += 1
 
             if tries > 10 * len(self._procs):
-                time.sleep(timeout)
-                timeout += 0.1
+                time.sleep(sleep_time)
+                sleep_time += 0.1
 
     def _restart(self) -> None:
         """Auxiliary to start or restart the external solver"""
@@ -1052,6 +1294,7 @@ class PortfolioSolver(SMTLIBSolver):
         self._support_reset = support_reset
         self._support_pushpop = support_pushpop
         self._multiple_check = multiple_check
+        self._init_solver_state()
 
         if not self._support_pushpop:
             setattr(self, "_push", None)
@@ -1076,6 +1319,13 @@ class PortfolioSolver(SMTLIBSolver):
 
         if constraints is not None:
             self._smtlib.send(constraints)
+            self._current_constraints_smtlib = constraints
+            self._current_constraints_hash = _stable_hash(constraints)
+        else:
+            self._current_constraints_smtlib = None
+            self._current_constraints_hash = None
+        self._current_constraints_set = None
+        self._current_declared_names = set()
 
 
 solver_selector = {
