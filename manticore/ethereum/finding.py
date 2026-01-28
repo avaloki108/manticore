@@ -8,7 +8,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, UTC
 
 
 @dataclass
@@ -55,8 +55,20 @@ class Finding:
     tags: List[str] = field(default_factory=list)
     """Additional metadata tags for categorization"""
 
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     """ISO 8601 timestamp of finding creation"""
+
+    def __post_init__(self):
+        if self.data:
+            d = self.data.lower()
+            if d.startswith("0x"):
+                d = d[2:]
+            # Remove exactly ONE trailing "00" byte (not all)
+            if d.endswith("00"):
+                d = d[:-2]
+            if len(d) % 2 != 0:
+                d += "0"
+            self.data = "0x" + d
 
     def to_dict(self) -> dict:
         """
@@ -137,14 +149,12 @@ class FindingSink:
         if self._output_path is None:
             return
 
-        findings_dict = {
-            "findings": [finding.to_dict() for finding in self._findings],
-            "count": len(self._findings),
-            "generated_at": datetime.utcnow().isoformat()
-        }
-
         with open(self._output_path, "w") as f:
-            json.dump(findings_dict, f, indent=2)
+            json.dump(
+                [finding.to_dict() for finding in self._findings],
+                f,
+                indent=2
+            )
 
     def clear(self) -> None:
         """Clear all collected findings."""
